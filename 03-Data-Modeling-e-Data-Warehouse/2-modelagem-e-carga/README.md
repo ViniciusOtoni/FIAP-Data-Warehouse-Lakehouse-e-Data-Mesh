@@ -1,0 +1,1315 @@
+# 03.1 - Do OLTP ao Star Schema: três modelagens, três respostas
+
+**Antes de começar, execute os passos abaixo para configurar o ambiente caso não tenha feito isso ainda na aula de HOJE: [Preparando Credenciais](../../00-create-codespaces/Inicio-de-aula.md)**
+
+**Antes de começar também, execute o passo de provisionamento da infraestrutura: [1-provisionamento](../1-provisionamento/README.md). Ele sobe cluster Redshift, bucket S3 e carrega o TPC-H via Terraform + shell script. Este laboratório assume que o cluster está `available` e o dataset já está em `s3://dw-lab-<ACCOUNT_ID>/raw/tpch/`.**
+
+Neste laboratório, você vai responder **exatamente a mesma pergunta de negócio** em três modelagens diferentes da mesma base, observar que os números divergem, e entender por que cada divergência tem uma justificativa legítima. No final, você registra a sua escolha em um `DECISION.md`, simulando o que um engenheiro de dados produz na vida real.
+
+## Principais pontos de aprendizagem
+
+- diferenciar modelo operacional (OLTP) de modelo analítico (star schema)
+- declarar o `grain` de uma tabela fato e entender o impacto
+- criar dimensões desnormalizadas com surrogate keys
+- aplicar SCD Tipo 1 e Tipo 2 e observar consequências numéricas
+- usar `DISTKEY`, `SORTKEY` e `DISTSTYLE ALL` no Redshift
+- materializar cálculos de negócio em coluna vs. calcular on-the-fly
+
+## O que você terá ao final
+
+Ao final deste laboratório, você terá implementado três modelagens do mesmo dataset TPC-H no mesmo cluster Redshift, executado a mesma query-âncora nas três, obtido três números diferentes e escrito um documento curto defendendo a modelagem escolhida.
+
+> [!TIP]
+> Sempre que encontrar um bloco com o título **💡 Clique para entender**, abra esse trecho. Ele traz explicação detalhada do comando, contexto prático da aula e links oficiais para aprofundamento.
+
+---
+
+## Contexto
+
+A tese central deste lab é que **a mesma pergunta de negócio pode produzir respostas diferentes quando a modelagem muda**. Isso não é bug — é consequência de contratos semânticos distintos. Entender isso separa um engenheiro de dados que "move arquivos" de um que "constrói produtos analíticos confiáveis".
+
+### A pergunta-âncora
+
+Esta é a única pergunta de negócio que você vai responder neste lab, mas você vai respondê-la três vezes:
+
+> **"Qual foi a receita líquida total do segmento `AUTOMOBILE` no ano de 1995, agrupada por região do cliente?"**
+
+A fórmula contratual da receita líquida, herdada do benchmark TPC-H, é `l_extendedprice × (1 - l_discount)`.
+
+### As três modelagens
+
+| Modelagem | Schema | Característica |
+|-----------|--------|----------------|
+| **A** — Espelho OLTP | `oltp_mirror` | Cópia fiel das 8 tabelas TPC-H |
+| **B** — Star Schema SCD1 | `dw_star` | Fato + dimensões; `dim_customer` guarda segmento **atual** |
+| **C** — Star Schema SCD2 | `dw_star_scd2` | Mesmo do B, mas `dim_customer` preserva **histórico** de segmento |
+
+---
+
+## Parte 1 - Acessando o Redshift pelo Query Editor v2
+
+### Resultado esperado desta parte
+
+Ao final desta etapa, você estará conectado ao cluster Redshift pelo editor de consultas do console AWS, com o banco `dw_mba` selecionado e pronto para receber comandos SQL.
+
+1. Abra o [console do Amazon Redshift Query Editor v2](https://us-east-1.console.aws.amazon.com/sqlworkbench/home?region=us-east-1#/client).
+
+<!-- PRINT SUGERIDO: img/redshift_query_editor_landing.png
+     Tela inicial do Query Editor v2 no console AWS, mostrando a árvore de clusters à esquerda.
+     Captura a janela inteira do browser com o editor ainda sem conexão feita. -->
+![](img/redshift_query_editor_landing.png)
+
+2. Clique com o botão direito no cluster `dw-aula3-<SHORT_ID>` e escolha **Create connection**.
+
+<!-- PRINT SUGERIDO: img/redshift_create_connection.png
+     Menu de contexto aberto no cluster, destacando a opção "Create connection".
+     Use zoom na árvore lateral esquerda para o cluster + menu aparecerem juntos. -->
+![](img/redshift_create_connection.png)
+
+3. Na caixa de autenticação, escolha **Database user name and password** e preencha:
+   - Database: `dw_mba`
+   - Username: `dwadmin`
+   - Password: o valor retornado por `terraform output -raw redshift_master_password` (no Codespaces, na pasta `1-provisionamento/`)
+
+<!-- PRINT SUGERIDO: img/redshift_connection_form.png
+     Caixa de autenticação preenchida (com a senha coberta/borrada).
+     Mostra os 3 campos: Database, Username, Password. -->
+![](img/redshift_connection_form.png)
+
+4. Teste a conexão executando:
+
+```sql
+SELECT current_database(), current_user, version();
+```
+
+O resultado deve retornar `dw_mba`, `dwadmin` e a versão do Redshift.
+
+<!-- PRINT SUGERIDO: img/redshift_first_query.png
+     Resultado da query com as 3 colunas preenchidas no painel Results do editor. -->
+![](img/redshift_first_query.png)
+
+### Checkpoint
+
+Se você chegou até aqui, então:
+
+- a conexão com o cluster está aberta
+- o banco `dw_mba` está selecionado
+- você pode executar SQL daqui para frente
+
+---
+
+## Parte 2 - Modelagem A: espelho do OLTP
+
+### Resultado esperado desta parte
+
+Ao final desta etapa, as 8 tabelas do TPC-H estarão criadas no schema `oltp_mirror` e carregadas via `COPY FROM S3`. A query-âncora terá produzido o primeiro número (`N₁`).
+
+5. Crie o schema e as 8 tabelas TPC-H. Este schema reproduz o modelo relacional operacional, sem qualquer transformação analítica:
+
+```sql
+DROP SCHEMA IF EXISTS oltp_mirror CASCADE;
+CREATE SCHEMA oltp_mirror;
+
+CREATE TABLE oltp_mirror.region (
+    r_regionkey INTEGER     NOT NULL PRIMARY KEY,
+    r_name      VARCHAR(25) NOT NULL,
+    r_comment   VARCHAR(152)
+)
+DISTSTYLE ALL;
+
+CREATE TABLE oltp_mirror.nation (
+    n_nationkey INTEGER     NOT NULL PRIMARY KEY,
+    n_name      VARCHAR(25) NOT NULL,
+    n_regionkey INTEGER     NOT NULL,
+    n_comment   VARCHAR(152)
+)
+DISTSTYLE ALL;
+
+CREATE TABLE oltp_mirror.customer (
+    c_custkey    BIGINT        NOT NULL PRIMARY KEY,
+    c_name       VARCHAR(25)   NOT NULL,
+    c_address    VARCHAR(40)   NOT NULL,
+    c_nationkey  INTEGER       NOT NULL,
+    c_phone      VARCHAR(15)   NOT NULL,
+    c_acctbal    DECIMAL(15,2) NOT NULL,
+    c_mktsegment VARCHAR(10)   NOT NULL,
+    c_comment    VARCHAR(117)  NOT NULL
+)
+DISTSTYLE AUTO;
+
+CREATE TABLE oltp_mirror.supplier (
+    s_suppkey   BIGINT        NOT NULL PRIMARY KEY,
+    s_name      VARCHAR(25)   NOT NULL,
+    s_address   VARCHAR(40)   NOT NULL,
+    s_nationkey INTEGER       NOT NULL,
+    s_phone     VARCHAR(15)   NOT NULL,
+    s_acctbal   DECIMAL(15,2) NOT NULL,
+    s_comment   VARCHAR(101)  NOT NULL
+)
+DISTSTYLE AUTO;
+
+CREATE TABLE oltp_mirror.part (
+    p_partkey     BIGINT        NOT NULL PRIMARY KEY,
+    p_name        VARCHAR(55)   NOT NULL,
+    p_mfgr        VARCHAR(25)   NOT NULL,
+    p_brand       VARCHAR(10)   NOT NULL,
+    p_type        VARCHAR(25)   NOT NULL,
+    p_size        INTEGER       NOT NULL,
+    p_container   VARCHAR(10)   NOT NULL,
+    p_retailprice DECIMAL(15,2) NOT NULL,
+    p_comment     VARCHAR(23)   NOT NULL
+)
+DISTSTYLE AUTO;
+
+CREATE TABLE oltp_mirror.partsupp (
+    ps_partkey    BIGINT        NOT NULL,
+    ps_suppkey    BIGINT        NOT NULL,
+    ps_availqty   INTEGER       NOT NULL,
+    ps_supplycost DECIMAL(15,2) NOT NULL,
+    ps_comment    VARCHAR(199)  NOT NULL,
+    PRIMARY KEY (ps_partkey, ps_suppkey)
+)
+DISTSTYLE AUTO;
+
+CREATE TABLE oltp_mirror.orders (
+    o_orderkey      BIGINT        NOT NULL PRIMARY KEY,
+    o_custkey       BIGINT        NOT NULL,
+    o_orderstatus   CHAR(1)       NOT NULL,
+    o_totalprice    DECIMAL(15,2) NOT NULL,
+    o_orderdate     DATE          NOT NULL,
+    o_orderpriority VARCHAR(15)   NOT NULL,
+    o_clerk         VARCHAR(15)   NOT NULL,
+    o_shippriority  INTEGER       NOT NULL,
+    o_comment       VARCHAR(79)   NOT NULL
+)
+DISTKEY (o_custkey)
+SORTKEY (o_orderdate);
+
+CREATE TABLE oltp_mirror.lineitem (
+    l_orderkey      BIGINT        NOT NULL,
+    l_partkey       BIGINT        NOT NULL,
+    l_suppkey       BIGINT        NOT NULL,
+    l_linenumber    INTEGER       NOT NULL,
+    l_quantity      DECIMAL(15,2) NOT NULL,
+    l_extendedprice DECIMAL(15,2) NOT NULL,
+    l_discount      DECIMAL(15,2) NOT NULL,
+    l_tax           DECIMAL(15,2) NOT NULL,
+    l_returnflag    CHAR(1)       NOT NULL,
+    l_linestatus    CHAR(1)       NOT NULL,
+    l_shipdate      DATE          NOT NULL,
+    l_commitdate    DATE          NOT NULL,
+    l_receiptdate   DATE          NOT NULL,
+    l_shipinstruct  VARCHAR(25)   NOT NULL,
+    l_shipmode      VARCHAR(10)   NOT NULL,
+    l_comment       VARCHAR(44)   NOT NULL,
+    PRIMARY KEY (l_orderkey, l_linenumber)
+)
+DISTKEY (l_orderkey)
+SORTKEY (l_shipdate);
+```
+
+<!-- PRINT SUGERIDO: img/oltp_create_schema_success.png
+     Painel "Query executed successfully" após rodar o CREATE SCHEMA + todos os CREATE TABLE.
+     Capturar a mensagem de sucesso + a árvore lateral mostrando o schema novo. -->
+![](img/oltp_create_schema_success.png)
+
+<details>
+<summary><b>💡 Clique para entender: escolhas físicas do schema OLTP mirror</b></summary>
+<blockquote>
+
+Mesmo que esta modelagem seja uma "cópia fiel" do operacional, ainda escolhemos chaves de distribuição e ordenação — porque o Redshift sempre precisa distribuir e ordenar dados entre slices. As decisões aqui são:
+
+### Por que `DISTSTYLE ALL` em `region` e `nation`
+
+São tabelas muito pequenas (5 e 25 linhas). Replicar integralmente em todos os slices elimina qualquer necessidade de redistribuição em joins. O custo em storage é desprezível.
+
+### Por que `DISTSTYLE AUTO` em customer/supplier/part/partsupp
+
+O Redshift analisa o tamanho e o padrão de uso e escolhe dinamicamente entre `ALL`, `EVEN` e `KEY`. Para tabelas médias, `AUTO` costuma ser o padrão mais seguro quando ainda não há workload estabilizado.
+
+### Por que `DISTKEY` em `orders.o_custkey` e `lineitem.l_orderkey`
+
+Essas são as duas tabelas grandes. Elas se unem entre si por `o_orderkey = l_orderkey`, então distribuir `orders` por `o_orderkey` e `lineitem` por `l_orderkey` colocaria as mesmas chaves no mesmo slice — mas preferimos distribuir `orders` por `o_custkey` porque a query-âncora junta pesado com `customer`. Essa é uma decisão que muda conforme o workload dominante.
+
+### Por que `SORTKEY` em colunas de data
+
+Sort keys em data habilitam **zone map pruning**: o Redshift armazena min/max por bloco e pode pular blocos inteiros quando a query tem filtro por faixa de data. O ganho é enorme em consultas como "vendas de 1995" — exatamente a nossa query-âncora.
+
+Documentação oficial:
+- [Choosing a data distribution style](https://docs.aws.amazon.com/redshift/latest/dg/c_choosing_dist_sort.html)
+- [Sort keys](https://docs.aws.amazon.com/redshift/latest/dg/t_Sorting_data.html)
+
+</blockquote>
+</details>
+
+6. Antes de carregar dados, descubra seu Account ID para montar a URL do S3:
+
+```sql
+SELECT current_user_id() AS user, current_aws_account() AS account_id;
+```
+
+<!-- PRINT SUGERIDO: img/redshift_account_id.png
+     Resultado da query mostrando o account_id. Usuário vai copiar esse valor para os próximos COPY. -->
+![](img/redshift_account_id.png)
+
+7. Carregue as 8 tabelas usando `COPY FROM S3`. **Substitua `<SEU_ACCOUNT_ID>` pelo valor obtido acima** antes de executar:
+
+```sql
+COPY oltp_mirror.region
+FROM 's3://dw-lab-<SEU_ACCOUNT_ID>/raw/tpch/region/'
+IAM_ROLE default
+FORMAT AS PARQUET;
+
+COPY oltp_mirror.nation
+FROM 's3://dw-lab-<SEU_ACCOUNT_ID>/raw/tpch/nation/'
+IAM_ROLE default
+FORMAT AS PARQUET;
+
+COPY oltp_mirror.customer
+FROM 's3://dw-lab-<SEU_ACCOUNT_ID>/raw/tpch/customer/'
+IAM_ROLE default
+FORMAT AS PARQUET;
+
+COPY oltp_mirror.supplier
+FROM 's3://dw-lab-<SEU_ACCOUNT_ID>/raw/tpch/supplier/'
+IAM_ROLE default
+FORMAT AS PARQUET;
+
+COPY oltp_mirror.part
+FROM 's3://dw-lab-<SEU_ACCOUNT_ID>/raw/tpch/part/'
+IAM_ROLE default
+FORMAT AS PARQUET;
+
+COPY oltp_mirror.partsupp
+FROM 's3://dw-lab-<SEU_ACCOUNT_ID>/raw/tpch/partsupp/'
+IAM_ROLE default
+FORMAT AS PARQUET;
+
+COPY oltp_mirror.orders
+FROM 's3://dw-lab-<SEU_ACCOUNT_ID>/raw/tpch/orders/'
+IAM_ROLE default
+FORMAT AS PARQUET;
+
+COPY oltp_mirror.lineitem
+FROM 's3://dw-lab-<SEU_ACCOUNT_ID>/raw/tpch/lineitem/'
+IAM_ROLE default
+FORMAT AS PARQUET;
+```
+
+<details>
+<summary><b>💡 Clique para entender: o comando COPY no Redshift</b></summary>
+<blockquote>
+
+O `COPY` é a forma canônica de carregar grandes volumes para o Redshift. Ele é muito mais eficiente do que `INSERT` linha a linha porque usa a arquitetura MPP para paralelizar a leitura entre slices.
+
+### Anatomia do comando
+
+- `FROM 's3://...'` aponta para o prefixo no S3. O Redshift lista todos os arquivos sob o prefixo e distribui entre os slices.
+- `IAM_ROLE default` diz "use a role padrão do cluster". No Terraform do Lab 03, configuramos `default_iam_role_arn = LabRole`, então nunca precisamos colar ARN explícito.
+- `FORMAT AS PARQUET` informa o formato. O Redshift deduz colunas/tipos pelo schema Parquet e faz mapping para as colunas da tabela pelo nome.
+
+### Por que não usar `INSERT SELECT` a partir de uma tabela externa
+
+Em ambientes onde Spectrum está disponível, você poderia criar uma external table e usar `INSERT SELECT`. Mas o `COPY` é mais rápido porque lê e escreve em paralelo por slice, sem passar pelo otimizador de query como uma leitura convencional.
+
+### Paralelismo implícito
+
+Cada slice do cluster puxa uma parte dos arquivos do S3. Mais arquivos Parquet = mais paralelismo. Nosso script `load_tpch.sh` gera 1 Parquet por tabela, então o paralelismo é limitado — em produção, split em vários arquivos maximiza throughput.
+
+Documentação oficial:
+- [COPY from Amazon S3](https://docs.aws.amazon.com/redshift/latest/dg/copy-parameters-data-source-s3.html)
+- [COPY from columnar data formats](https://docs.aws.amazon.com/redshift/latest/dg/copy-usage_notes-copy-from-columnar.html)
+
+</blockquote>
+</details>
+
+8. Atualize as estatísticas do otimizador (passo rápido mas importante para os planos subsequentes):
+
+```sql
+ANALYZE oltp_mirror.region;
+ANALYZE oltp_mirror.nation;
+ANALYZE oltp_mirror.customer;
+ANALYZE oltp_mirror.supplier;
+ANALYZE oltp_mirror.part;
+ANALYZE oltp_mirror.partsupp;
+ANALYZE oltp_mirror.orders;
+ANALYZE oltp_mirror.lineitem;
+```
+
+9. Confirme que os volumes batem com o TPC-H SF1:
+
+```sql
+SELECT 'region'   AS tbl, COUNT(*) AS linhas, 5        AS esperado FROM oltp_mirror.region
+UNION ALL
+SELECT 'nation'   AS tbl, COUNT(*) AS linhas, 25       AS esperado FROM oltp_mirror.nation
+UNION ALL
+SELECT 'customer' AS tbl, COUNT(*) AS linhas, 150000   AS esperado FROM oltp_mirror.customer
+UNION ALL
+SELECT 'supplier' AS tbl, COUNT(*) AS linhas, 10000    AS esperado FROM oltp_mirror.supplier
+UNION ALL
+SELECT 'part'     AS tbl, COUNT(*) AS linhas, 200000   AS esperado FROM oltp_mirror.part
+UNION ALL
+SELECT 'partsupp' AS tbl, COUNT(*) AS linhas, 800000   AS esperado FROM oltp_mirror.partsupp
+UNION ALL
+SELECT 'orders'   AS tbl, COUNT(*) AS linhas, 1500000  AS esperado FROM oltp_mirror.orders
+UNION ALL
+SELECT 'lineitem' AS tbl, COUNT(*) AS linhas, 6001215  AS esperado FROM oltp_mirror.lineitem
+ORDER BY tbl;
+```
+
+<!-- PRINT SUGERIDO: img/oltp_sanity_check.png
+     Resultado das 8 linhas com "linhas" == "esperado" em todos os casos.
+     Essa é a evidência de que o COPY funcionou corretamente. -->
+![](img/oltp_sanity_check.png)
+
+> [!IMPORTANT]
+> Se alguma contagem **não bater**, o `COPY` falhou para aquela tabela. Consulte a tabela de erros com `SELECT filename, line_number, colname, err_reason FROM stl_load_errors ORDER BY starttime DESC LIMIT 10;`
+
+10. Execute a query-âncora pela primeira vez, no modelo OLTP:
+
+```sql
+SELECT
+    r.r_name                                                 AS region_name,
+    ROUND(SUM(l.l_extendedprice * (1 - l.l_discount)), 2)    AS receita_liquida_1995_automobile,
+    COUNT(*)                                                 AS qtd_itens,
+    COUNT(DISTINCT o.o_custkey)                              AS qtd_clientes_distintos
+FROM oltp_mirror.lineitem l
+JOIN oltp_mirror.orders   o ON o.o_orderkey = l.l_orderkey
+JOIN oltp_mirror.customer c ON c.c_custkey  = o.o_custkey
+JOIN oltp_mirror.nation   n ON n.n_nationkey = c.c_nationkey
+JOIN oltp_mirror.region   r ON r.r_regionkey = n.n_regionkey
+WHERE o.o_orderdate >= DATE '1995-01-01'
+  AND o.o_orderdate <  DATE '1996-01-01'
+  AND c.c_mktsegment = 'AUTOMOBILE'
+GROUP BY r.r_name
+ORDER BY receita_liquida_1995_automobile DESC;
+```
+
+<!-- PRINT SUGERIDO: img/query_ancora_N1.png
+     Resultado da query-âncora no modelo A. As 5 regiões aparecem ordenadas por receita descendente.
+     Destaque o valor de AMERICA (linha superior) — é o número que o aluno vai comparar com N2 e N3. -->
+![](img/query_ancora_N1.png)
+
+> [!TIP]
+> **Anote o valor de `AMERICA` como `N₁`**. Ele será comparado com `N₂` (Modelagem B) e `N₃` (Modelagem C) no final do lab.
+
+<details>
+<summary><b>💡 Clique para entender: por que esta query expõe tanta decisão de modelagem</b></summary>
+<blockquote>
+
+A query parece simples, mas cada pedaço expõe uma decisão que muda quando mudamos de modelagem:
+
+- **5 joins** entre tabelas relacionais. No star schema (próxima parte), esse número cai para 3.
+- **Filtro `o_orderdate`** espalhado em uma tabela diferente do filtro `c_mktsegment`. No star schema, ambos filtros ficam em dimensões próximas ao fato.
+- **`l_extendedprice * (1 - l_discount)`** calculado on-the-fly. No star schema, vamos materializar esse cálculo.
+- **`c.c_mktsegment`** lê o estado **atual** da tabela. Se um cliente foi reclassificado depois de 1995, a venda vai aparecer sob o segmento atual — não o de 1995. É aqui que a diferença SCD1 vs. SCD2 vai morder o número.
+
+### Padrão mental
+
+Guarde esta frase: *"No OLTP, a tabela é o retrato de AGORA. No warehouse com SCD2, a tabela pode preservar AGORA e ENTÃO."*
+
+</blockquote>
+</details>
+
+### Checkpoint
+
+Se você chegou até aqui, então:
+
+- o schema `oltp_mirror` existe e tem as 8 tabelas carregadas
+- a query-âncora rodou e você anotou `N₁`
+
+---
+
+## Parte 3 - Modelagem B: star schema com SCD Tipo 1
+
+### Resultado esperado desta parte
+
+Ao final desta etapa, o schema `dw_star` terá 5 dimensões (`dim_data`, `dim_customer`, `dim_produto`, `dim_supplier`, `dim_geografia`) e uma fato (`f_vendas`), todas com surrogate keys e estratégia física adequada. A query-âncora terá produzido `N₂`.
+
+11. Crie o schema:
+
+```sql
+DROP SCHEMA IF EXISTS dw_star CASCADE;
+CREATE SCHEMA dw_star;
+```
+
+<details>
+<summary><b>💡 Clique para entender: o grain da fato como contrato</b></summary>
+<blockquote>
+
+Antes de qualquer tabela, é preciso declarar o **grain**:
+
+> Uma linha de `dw_star.f_vendas` representa um item (`l_linenumber`) de um pedido (`o_orderkey`), vendido em uma data (data do pedido), para um cliente (`customer_sk`), de um produto (`produto_sk`), fornecido por um fornecedor (`supplier_sk`).
+
+Isso é o mesmo grain da tabela `lineitem` do TPC-H. A diferença é que agora as chaves naturais foram trocadas por surrogate keys.
+
+### Por que declarar o grain por escrito
+
+Se uma linha da fato misturar "um item" e "um pedido inteiro" (ou pior: um item **e** um ajuste posterior do pedido), todas as agregações podem ficar duplicando ou perdendo dados. O grain é o contrato que impede isso.
+
+### Em produção
+
+Em um warehouse real, o grain fica documentado no catálogo de dados, no dbt `description`, em comentários da própria tabela Redshift (`COMMENT ON TABLE ... IS '...'`), e em ADRs (Architecture Decision Records).
+
+</blockquote>
+</details>
+
+12. Crie e popule a `dim_data`, cobrindo 1992-01-01 a 1998-12-31:
+
+```sql
+CREATE TABLE dw_star.dim_data (
+    data_sk          INTEGER     NOT NULL PRIMARY KEY,
+    dt_completa      DATE        NOT NULL,
+    nr_ano           SMALLINT    NOT NULL,
+    nr_trimestre     SMALLINT    NOT NULL,
+    nr_mes           SMALLINT    NOT NULL,
+    nm_mes           VARCHAR(15) NOT NULL,
+    nr_dia           SMALLINT    NOT NULL,
+    nr_dia_semana    SMALLINT    NOT NULL,
+    nm_dia_semana    VARCHAR(15) NOT NULL,
+    fl_fim_de_semana BOOLEAN     NOT NULL,
+    nr_semana_ano    SMALLINT    NOT NULL,
+    nm_ano_trimestre VARCHAR(10) NOT NULL
+)
+DISTSTYLE ALL
+SORTKEY (dt_completa);
+
+INSERT INTO dw_star.dim_data
+WITH numeros AS (
+    SELECT ROW_NUMBER() OVER () - 1 AS n
+    FROM stl_plan_info
+    LIMIT 2557
+),
+datas AS (
+    SELECT DATEADD(day, n, DATE '1992-01-01') AS dt
+    FROM numeros
+)
+SELECT
+    CAST(TO_CHAR(dt, 'YYYYMMDD') AS INTEGER) AS data_sk,
+    dt                                       AS dt_completa,
+    EXTRACT(YEAR    FROM dt)                 AS nr_ano,
+    EXTRACT(QUARTER FROM dt)                 AS nr_trimestre,
+    EXTRACT(MONTH   FROM dt)                 AS nr_mes,
+    TRIM(TO_CHAR(dt, 'Month'))               AS nm_mes,
+    EXTRACT(DAY     FROM dt)                 AS nr_dia,
+    EXTRACT(DOW     FROM dt)                 AS nr_dia_semana,
+    TRIM(TO_CHAR(dt, 'Day'))                 AS nm_dia_semana,
+    CASE WHEN EXTRACT(DOW FROM dt) IN (0,6) THEN TRUE ELSE FALSE END AS fl_fim_de_semana,
+    EXTRACT(WEEK    FROM dt)                 AS nr_semana_ano,
+    EXTRACT(YEAR FROM dt) || '-Q' || EXTRACT(QUARTER FROM dt) AS nm_ano_trimestre
+FROM datas;
+
+ANALYZE dw_star.dim_data;
+```
+
+13. Valide que a dimensão foi populada corretamente:
+
+```sql
+SELECT
+    COUNT(*)             AS total_datas,
+    MIN(dt_completa)     AS primeira_data,
+    MAX(dt_completa)     AS ultima_data
+FROM dw_star.dim_data;
+```
+
+O esperado é 2557 linhas, de 1992-01-01 a 1998-12-31.
+
+<!-- PRINT SUGERIDO: img/dim_data_loaded.png
+     Resultado mostrando 2557 linhas e as datas extremas. -->
+![](img/dim_data_loaded.png)
+
+<details>
+<summary><b>💡 Clique para entender: por que gerar dim_data em vez de trazer de uma tabela</b></summary>
+<blockquote>
+
+O TPC-H não traz uma tabela de datas. Se a gente quisesse filtrar por ano, seria `EXTRACT(YEAR FROM o_orderdate)` espalhado em toda query analítica. Isso tem três problemas:
+
+1. **Sem atributos**: `EXTRACT` não te dá trimestre, nome do mês, fim de semana, feriado, semana ISO, dia útil. Cada análise vai reinventar essa lógica.
+2. **Sem consistência**: se analista A usa `semana de segunda-a-domingo` e analista B usa `semana ISO`, os números não batem.
+3. **Sem performance**: função sobre coluna impede o uso eficiente de sort key em alguns casos.
+
+### Técnica usada aqui: tally table
+
+`stl_plan_info` é uma system table grande o suficiente para gerar 2557 linhas via `ROW_NUMBER() OVER () - 1`. Isso é um truque padrão em data warehouses sem uma tabela de sequência dedicada.
+
+### Em produção
+
+Dim_data é a primeira coisa que se monta em um warehouse serio. Ela costuma ter ainda:
+- `fl_feriado`
+- `nm_feriado`
+- `fl_dia_util`
+- `fiscal_year`, `fiscal_quarter` (calendário fiscal da empresa)
+- flags de alta temporada, datas comemorativas, periodo promocional
+
+### Fallback com CTE recursiva
+
+Se `stl_plan_info` estiver vazia (pode acontecer em cluster recém-criado), use a versão com `WITH RECURSIVE serie(dt) AS ... ` — documentada como comentário no arquivo `sql/b_star_scd1/02_dim_data.sql`.
+
+</blockquote>
+</details>
+
+14. Crie e popule as 4 dimensões restantes (geografia, customer SCD1, produto, supplier):
+
+```sql
+CREATE TABLE dw_star.dim_geografia (
+    geografia_sk  INTEGER     NOT NULL,
+    n_nationkey   INTEGER     NOT NULL,
+    nm_nacao      VARCHAR(25) NOT NULL,
+    nm_regiao     VARCHAR(25) NOT NULL
+)
+DISTSTYLE ALL
+SORTKEY (nm_regiao);
+
+INSERT INTO dw_star.dim_geografia (geografia_sk, n_nationkey, nm_nacao, nm_regiao)
+SELECT
+    n.n_nationkey AS geografia_sk,
+    n.n_nationkey,
+    n.n_name      AS nm_nacao,
+    r.r_name      AS nm_regiao
+FROM oltp_mirror.nation n
+JOIN oltp_mirror.region r ON r.r_regionkey = n.n_regionkey;
+
+ANALYZE dw_star.dim_geografia;
+
+CREATE TABLE dw_star.dim_customer (
+    customer_sk  BIGINT        NOT NULL,
+    c_custkey    BIGINT        NOT NULL,
+    nm_cliente   VARCHAR(25)   NOT NULL,
+    sg_segmento  VARCHAR(10)   NOT NULL,
+    vl_saldo     DECIMAL(15,2) NOT NULL,
+    n_nationkey  INTEGER       NOT NULL
+)
+DISTKEY (customer_sk)
+SORTKEY (sg_segmento);
+
+INSERT INTO dw_star.dim_customer (customer_sk, c_custkey, nm_cliente, sg_segmento, vl_saldo, n_nationkey)
+SELECT
+    c.c_custkey AS customer_sk,
+    c.c_custkey,
+    c.c_name,
+    c.c_mktsegment,
+    c.c_acctbal,
+    c.c_nationkey
+FROM oltp_mirror.customer c;
+
+ANALYZE dw_star.dim_customer;
+
+CREATE TABLE dw_star.dim_produto (
+    produto_sk       BIGINT        NOT NULL,
+    p_partkey        BIGINT        NOT NULL,
+    nm_produto       VARCHAR(55)   NOT NULL,
+    nm_fabricante    VARCHAR(25)   NOT NULL,
+    nm_marca         VARCHAR(10)   NOT NULL,
+    ds_tipo          VARCHAR(25)   NOT NULL,
+    nr_tamanho       INTEGER       NOT NULL,
+    nm_container     VARCHAR(10)   NOT NULL,
+    vl_preco_varejo  DECIMAL(15,2) NOT NULL
+)
+DISTKEY (produto_sk)
+SORTKEY (nm_marca);
+
+INSERT INTO dw_star.dim_produto
+SELECT
+    p.p_partkey AS produto_sk,
+    p.p_partkey,
+    p.p_name,
+    p.p_mfgr,
+    p.p_brand,
+    p.p_type,
+    p.p_size,
+    p.p_container,
+    p.p_retailprice
+FROM oltp_mirror.part p;
+
+ANALYZE dw_star.dim_produto;
+
+CREATE TABLE dw_star.dim_supplier (
+    supplier_sk   BIGINT        NOT NULL,
+    s_suppkey     BIGINT        NOT NULL,
+    nm_fornecedor VARCHAR(25)   NOT NULL,
+    vl_saldo      DECIMAL(15,2) NOT NULL,
+    n_nationkey   INTEGER       NOT NULL
+)
+DISTSTYLE ALL
+SORTKEY (supplier_sk);
+
+INSERT INTO dw_star.dim_supplier
+SELECT
+    s.s_suppkey,
+    s.s_suppkey,
+    s.s_name,
+    s.s_acctbal,
+    s.s_nationkey
+FROM oltp_mirror.supplier s;
+
+ANALYZE dw_star.dim_supplier;
+```
+
+<details>
+<summary><b>💡 Clique para entender: por que dim_geografia achata nation + region</b></summary>
+<blockquote>
+
+No OLTP, `nation` aponta para `region` via FK. No warehouse, a gente **achata** essa hierarquia dentro de uma única dimensão. Isso é o que separa um **star schema** de um **snowflake**.
+
+### Em star
+
+```
+f_vendas  ──► dim_geografia (nacao, regiao juntos)
+```
+
+### Em snowflake
+
+```
+f_vendas  ──► dim_nacao  ──► dim_regiao
+```
+
+### Por que star é preferido para BI
+
+- **Menos joins em cada consulta** — analistas filtram por `nm_regiao` e `nm_nacao` na mesma dimensão.
+- **Plano de execução mais simples** — menos chance de o otimizador errar.
+- **Melhor experiência em ferramentas de BI** — semantic layers como Power BI, Looker, QuickSight funcionam melhor com star.
+
+### Quando snowflake faz sentido
+
+Quando a dimensão normalizada é **gigante** (milhões de linhas com hierarquia profunda) ou quando múltiplas fatos reutilizam o mesmo nível da hierarquia separadamente. Para nosso caso (25 nações, 5 regiões), star é a escolha óbvia.
+
+</blockquote>
+</details>
+
+15. Confirme contagens:
+
+```sql
+SELECT 'dim_data'      AS dim, COUNT(*) AS linhas FROM dw_star.dim_data
+UNION ALL
+SELECT 'dim_geografia', COUNT(*) FROM dw_star.dim_geografia
+UNION ALL
+SELECT 'dim_customer',  COUNT(*) FROM dw_star.dim_customer
+UNION ALL
+SELECT 'dim_produto',   COUNT(*) FROM dw_star.dim_produto
+UNION ALL
+SELECT 'dim_supplier',  COUNT(*) FROM dw_star.dim_supplier
+ORDER BY dim;
+```
+
+Esperado: dim_data=2557, dim_geografia=25, dim_customer=150000, dim_produto=200000, dim_supplier=10000.
+
+<!-- PRINT SUGERIDO: img/dw_star_dims_loaded.png
+     Resultado das 5 dimensões com contagem correspondente.
+     Evidência de que o CTAS das dimensões funcionou. -->
+![](img/dw_star_dims_loaded.png)
+
+16. Crie e carregue a tabela fato `f_vendas`:
+
+```sql
+CREATE TABLE dw_star.f_vendas (
+    data_sk              INTEGER       NOT NULL,
+    customer_sk          BIGINT        NOT NULL,
+    produto_sk           BIGINT        NOT NULL,
+    supplier_sk          BIGINT        NOT NULL,
+    geografia_sk         INTEGER       NOT NULL,
+
+    nr_pedido            BIGINT        NOT NULL,
+    nr_linha_pedido      INTEGER       NOT NULL,
+
+    qt_vendida           DECIMAL(15,2) NOT NULL,
+    vl_preco_estendido   DECIMAL(15,2) NOT NULL,
+    vl_desconto_pct      DECIMAL(15,2) NOT NULL,
+    vl_imposto_pct       DECIMAL(15,2) NOT NULL,
+
+    vl_receita_bruta     DECIMAL(18,4) NOT NULL,
+    vl_receita_liquida   DECIMAL(18,4) NOT NULL,
+    vl_receita_final     DECIMAL(18,4) NOT NULL,
+
+    fl_retornado         CHAR(1)       NOT NULL,
+    fl_status_linha      CHAR(1)       NOT NULL,
+    dt_envio             DATE          NOT NULL,
+    dt_recebimento       DATE          NOT NULL
+)
+DISTKEY (customer_sk)
+SORTKEY (data_sk);
+
+INSERT INTO dw_star.f_vendas
+SELECT
+    CAST(TO_CHAR(o.o_orderdate, 'YYYYMMDD') AS INTEGER)   AS data_sk,
+    c.customer_sk,
+    pr.produto_sk,
+    s.supplier_sk,
+    g.geografia_sk,
+    l.l_orderkey,
+    l.l_linenumber,
+    l.l_quantity,
+    l.l_extendedprice,
+    l.l_discount,
+    l.l_tax,
+    l.l_extendedprice                                     AS vl_receita_bruta,
+    l.l_extendedprice * (1 - l.l_discount)                AS vl_receita_liquida,
+    l.l_extendedprice * (1 - l.l_discount) * (1 + l.l_tax) AS vl_receita_final,
+    l.l_returnflag,
+    l.l_linestatus,
+    l.l_shipdate,
+    l.l_receiptdate
+FROM oltp_mirror.lineitem l
+JOIN oltp_mirror.orders   o  ON o.o_orderkey   = l.l_orderkey
+JOIN dw_star.dim_customer c  ON c.c_custkey    = o.o_custkey
+JOIN dw_star.dim_produto  pr ON pr.p_partkey   = l.l_partkey
+JOIN dw_star.dim_supplier s  ON s.s_suppkey    = l.l_suppkey
+JOIN dw_star.dim_geografia g ON g.n_nationkey  = c.n_nationkey;
+
+ANALYZE dw_star.f_vendas;
+```
+
+A execução do `INSERT` deve levar 1-2 minutos (6 milhões de linhas).
+
+<details>
+<summary><b>💡 Clique para entender: as 3 medidas de receita materializadas</b></summary>
+<blockquote>
+
+Na fato criamos três colunas de receita calculadas:
+
+- `vl_receita_bruta` = `l_extendedprice`
+- `vl_receita_liquida` = `l_extendedprice × (1 - l_discount)` ← esta é a usada na query-âncora
+- `vl_receita_final` = `l_extendedprice × (1 - l_discount) × (1 + l_tax)`
+
+### Por que materializar em vez de calcular on-the-fly
+
+**Contratualização**. Toda query analítica que precisar desses números vai usar a mesma fórmula, sem risco de um time aplicar a fórmula errada. Mudar a coluna do dia para noite não é trivial — é exatamente isso que exploramos no Lab 03.2.
+
+### Trade-off de storage
+
+3 colunas `DECIMAL(18,4)` × 6M linhas consomem algumas centenas de MB a mais. Em um warehouse com dezenas de TB, isso é invisível. Em ambiente limitado, você poderia materializar só `vl_receita_liquida` e calcular as outras em view.
+
+### Padrão mental
+
+- **Medidas brutas**: `l_quantity`, `l_extendedprice`, `l_discount` (não aditiva!), `l_tax` (não aditiva!)
+- **Medidas derivadas materializadas**: as 3 de receita
+- **Medidas derivadas on-the-fly**: tudo que só um BI específico usa (ex: `receita_media_por_pedido`)
+
+</blockquote>
+</details>
+
+17. Execute a query-âncora no star schema:
+
+```sql
+SELECT
+    g.nm_regiao                                    AS region_name,
+    ROUND(SUM(f.vl_receita_liquida), 2)            AS receita_liquida_1995_automobile,
+    COUNT(*)                                       AS qtd_itens,
+    COUNT(DISTINCT f.customer_sk)                  AS qtd_clientes_distintos
+FROM dw_star.f_vendas    f
+JOIN dw_star.dim_customer  c ON c.customer_sk  = f.customer_sk
+JOIN dw_star.dim_geografia g ON g.geografia_sk = f.geografia_sk
+JOIN dw_star.dim_data      d ON d.data_sk      = f.data_sk
+WHERE d.nr_ano       = 1995
+  AND c.sg_segmento  = 'AUTOMOBILE'
+GROUP BY g.nm_regiao
+ORDER BY receita_liquida_1995_automobile DESC;
+```
+
+<!-- PRINT SUGERIDO: img/query_ancora_N2.png
+     Resultado da query-âncora no modelo B. Comparar AMERICA com N1 — devem ser ≈ iguais (SCD1 = segmento atual). -->
+![](img/query_ancora_N2.png)
+
+> [!TIP]
+> **Anote o valor de `AMERICA` como `N₂`**. Compare com `N₁` — eles devem ser praticamente iguais (pequenas diferenças de arredondamento são esperadas).
+
+18. Compare os planos de execução OLTP vs. Star para sentir a diferença estrutural:
+
+```sql
+EXPLAIN
+SELECT r.r_name, SUM(l.l_extendedprice * (1 - l.l_discount))
+FROM oltp_mirror.lineitem l
+JOIN oltp_mirror.orders   o ON o.o_orderkey   = l.l_orderkey
+JOIN oltp_mirror.customer c ON c.c_custkey    = o.o_custkey
+JOIN oltp_mirror.nation   n ON n.n_nationkey  = c.c_nationkey
+JOIN oltp_mirror.region   r ON r.r_regionkey  = n.n_regionkey
+WHERE o.o_orderdate >= DATE '1995-01-01'
+  AND o.o_orderdate <  DATE '1996-01-01'
+  AND c.c_mktsegment = 'AUTOMOBILE'
+GROUP BY r.r_name;
+```
+
+Guarde o plano. Agora o equivalente no star:
+
+```sql
+EXPLAIN
+SELECT g.nm_regiao, SUM(f.vl_receita_liquida)
+FROM dw_star.f_vendas      f
+JOIN dw_star.dim_customer  c ON c.customer_sk  = f.customer_sk
+JOIN dw_star.dim_geografia g ON g.geografia_sk = f.geografia_sk
+JOIN dw_star.dim_data      d ON d.data_sk      = f.data_sk
+WHERE d.nr_ano       = 1995
+  AND c.sg_segmento  = 'AUTOMOBILE'
+GROUP BY g.nm_regiao;
+```
+
+<!-- PRINT SUGERIDO: img/explain_oltp_vs_star.png
+     Dois planos de EXPLAIN lado a lado (ou em sequência).
+     Destaque que o star tem menos nós de JOIN e não redistribui dim_geografia (DISTSTYLE ALL). -->
+![](img/explain_oltp_vs_star.png)
+
+### Checkpoint
+
+Se você chegou até aqui, então:
+
+- o schema `dw_star` tem 5 dimensões e uma fato
+- a query-âncora rodou e `N₂ ≈ N₁`
+- você comparou os planos de execução OLTP vs. Star
+
+---
+
+## Parte 4 - Modelagem C: star schema com SCD Tipo 2
+
+### Resultado esperado desta parte
+
+Ao final desta etapa, o schema `dw_star_scd2` terá uma `dim_customer` versionada com histórico de segmento e uma fato `f_vendas` apontando para a versão vigente na data de cada pedido. A query-âncora vai produzir `N₃`, **diferente** de `N₁` e `N₂`.
+
+19. Crie o schema e carregue a tabela auxiliar `customer_history`. Essa tabela foi gerada sinteticamente pelo `load_tpch.sh` e contém reclassificações de segmento pós-1995 em 5% dos clientes:
+
+```sql
+DROP SCHEMA IF EXISTS dw_star_scd2 CASCADE;
+CREATE SCHEMA dw_star_scd2;
+
+CREATE TABLE dw_star_scd2.customer_history (
+    c_custkey       BIGINT      NOT NULL,
+    mktsegment_new  VARCHAR(10) NOT NULL,
+    valid_from      DATE        NOT NULL
+)
+DISTSTYLE AUTO
+SORTKEY (c_custkey);
+```
+
+20. Carregue a `customer_history` (lembre-se de substituir `<SEU_ACCOUNT_ID>`):
+
+```sql
+COPY dw_star_scd2.customer_history
+FROM 's3://dw-lab-<SEU_ACCOUNT_ID>/raw/tpch/customer_history/'
+IAM_ROLE default
+FORMAT AS PARQUET;
+
+ANALYZE dw_star_scd2.customer_history;
+
+SELECT COUNT(*) AS reclassificacoes FROM dw_star_scd2.customer_history;
+```
+
+O resultado esperado é **~7500 linhas** (5% de 150k clientes).
+
+<!-- PRINT SUGERIDO: img/customer_history_loaded.png
+     Resultado mostrando ~7500 reclassificações carregadas. -->
+![](img/customer_history_loaded.png)
+
+21. Crie a `dim_customer` versionada. Ela terá uma linha para clientes sem histórico e duas linhas para os reclassificados (versão original + versão nova):
+
+```sql
+CREATE TABLE dw_star_scd2.dim_customer (
+    customer_sk       BIGINT        NOT NULL,
+    c_custkey         BIGINT        NOT NULL,
+    nm_cliente        VARCHAR(25)   NOT NULL,
+    sg_segmento       VARCHAR(10)   NOT NULL,
+    vl_saldo          DECIMAL(15,2) NOT NULL,
+    n_nationkey       INTEGER       NOT NULL,
+    valid_from        DATE          NOT NULL,
+    valid_to          DATE          NOT NULL,
+    is_current        BOOLEAN       NOT NULL
+)
+DISTKEY (customer_sk)
+SORTKEY (c_custkey, valid_from);
+
+-- Onda 1: clientes sem reclassificação (1 linha cada)
+INSERT INTO dw_star_scd2.dim_customer
+SELECT
+    c.c_custkey * 10 + 1    AS customer_sk,
+    c.c_custkey,
+    c.c_name                AS nm_cliente,
+    c.c_mktsegment          AS sg_segmento,
+    c.c_acctbal             AS vl_saldo,
+    c.c_nationkey,
+    DATE '1900-01-01'       AS valid_from,
+    DATE '9999-12-31'       AS valid_to,
+    TRUE                    AS is_current
+FROM oltp_mirror.customer c
+WHERE c.c_custkey NOT IN (SELECT c_custkey FROM dw_star_scd2.customer_history);
+
+-- Onda 2A: versão ORIGINAL dos reclassificados (vigente ANTES da mudança)
+INSERT INTO dw_star_scd2.dim_customer
+SELECT
+    c.c_custkey * 10 + 1            AS customer_sk,
+    c.c_custkey,
+    c.c_name,
+    c.c_mktsegment                  AS sg_segmento,
+    c.c_acctbal,
+    c.c_nationkey,
+    DATE '1900-01-01'               AS valid_from,
+    h.valid_from - INTERVAL '1 day' AS valid_to,
+    FALSE                           AS is_current
+FROM oltp_mirror.customer          c
+JOIN dw_star_scd2.customer_history h ON h.c_custkey = c.c_custkey;
+
+-- Onda 2B: versão NOVA dos reclassificados (vigente a partir de valid_from)
+INSERT INTO dw_star_scd2.dim_customer
+SELECT
+    c.c_custkey * 10 + 2            AS customer_sk,
+    c.c_custkey,
+    c.c_name,
+    h.mktsegment_new                AS sg_segmento,
+    c.c_acctbal,
+    c.c_nationkey,
+    h.valid_from                    AS valid_from,
+    DATE '9999-12-31'               AS valid_to,
+    TRUE                            AS is_current
+FROM oltp_mirror.customer          c
+JOIN dw_star_scd2.customer_history h ON h.c_custkey = c.c_custkey;
+
+ANALYZE dw_star_scd2.dim_customer;
+```
+
+<details>
+<summary><b>💡 Clique para entender: convenção de surrogate key em SCD2</b></summary>
+<blockquote>
+
+Toda versão recebe um `customer_sk` único. A convenção adotada aqui é:
+
+- `customer_sk = c_custkey × 10 + 1` → **versão original** (segmento pré-reclassificação)
+- `customer_sk = c_custkey × 10 + 2` → **versão nova** (pós-reclassificação)
+
+### Por que funciona
+
+- É **determinístico**: todo aluno gera os mesmos IDs na mesma ordem.
+- É **legível**: olhando o SK, você sabe qual cliente é e qual versão.
+- É **reversível**: dado um `customer_sk`, você recupera `c_custkey = customer_sk / 10`.
+
+### Em produção, o padrão costuma ser diferente
+
+Warehouses reais usam `IDENTITY` ou UUID, não expõem o `c_custkey` embutido no SK. Motivo: segurança + evolução (e se um dia tiver mais de 10 versões?). Aqui a convenção é pedagógica — facilita depuração e anotações.
+
+### Estrutura final
+
+| c_custkey | customer_sk | sg_segmento | valid_from  | valid_to    | is_current |
+|-----------|-------------|-------------|-------------|-------------|------------|
+| 42        | 421         | AUTOMOBILE  | 1900-01-01  | 1996-08-14  | FALSE      |
+| 42        | 422         | BUILDING    | 1996-08-15  | 9999-12-31  | TRUE       |
+| 43        | 431         | FURNITURE   | 1900-01-01  | 9999-12-31  | TRUE       |
+
+O cliente 42 foi reclassificado em 1996-08-15. O cliente 43 nunca mudou.
+
+</blockquote>
+</details>
+
+22. Valide a integridade da `dim_customer` versionada com três checks:
+
+```sql
+-- 1) Todo cliente deve ter pelo menos uma versão atual
+SELECT
+    'clientes_sem_versao_atual' AS check_name,
+    COUNT(*) AS qtd
+FROM oltp_mirror.customer c
+WHERE NOT EXISTS (
+    SELECT 1 FROM dw_star_scd2.dim_customer d
+    WHERE d.c_custkey = c.c_custkey AND d.is_current = TRUE
+);
+
+-- 2) Nenhum cliente pode ter intervalos temporais sobrepostos
+WITH pares AS (
+    SELECT c_custkey, valid_from, valid_to,
+           LAG(valid_to) OVER (PARTITION BY c_custkey ORDER BY valid_from) AS prev_valid_to
+    FROM dw_star_scd2.dim_customer
+)
+SELECT 'sobreposicoes_scd2' AS check_name, COUNT(*) AS qtd
+FROM pares
+WHERE prev_valid_to IS NOT NULL AND prev_valid_to >= valid_from;
+
+-- 3) Distribuição das versões
+SELECT
+    COUNT(DISTINCT c_custkey)                                    AS clientes_distintos,
+    COUNT(*)                                                     AS total_linhas,
+    SUM(CASE WHEN is_current THEN 1 ELSE 0 END)                  AS linhas_atuais,
+    SUM(CASE WHEN NOT is_current THEN 1 ELSE 0 END)              AS linhas_historicas
+FROM dw_star_scd2.dim_customer;
+```
+
+Os checks 1 e 2 devem retornar **0**. O check 3 deve mostrar ~150k clientes, ~157k linhas totais (150k atuais + 7.5k históricas).
+
+<!-- PRINT SUGERIDO: img/scd2_integrity_checks.png
+     Os 3 checks com os resultados corretos. O 0+0 nos dois primeiros é a evidência de que a SCD2 foi construída certinho. -->
+![](img/scd2_integrity_checks.png)
+
+23. Crie e carregue a fato `f_vendas` apontando para a versão correta do cliente em cada data. O segredo aqui é o **join com range temporal**:
+
+```sql
+CREATE TABLE dw_star_scd2.f_vendas (
+    data_sk              INTEGER       NOT NULL,
+    customer_sk          BIGINT        NOT NULL,
+    produto_sk           BIGINT        NOT NULL,
+    supplier_sk          BIGINT        NOT NULL,
+    geografia_sk         INTEGER       NOT NULL,
+    nr_pedido            BIGINT        NOT NULL,
+    nr_linha_pedido      INTEGER       NOT NULL,
+    qt_vendida           DECIMAL(15,2) NOT NULL,
+    vl_preco_estendido   DECIMAL(15,2) NOT NULL,
+    vl_desconto_pct      DECIMAL(15,2) NOT NULL,
+    vl_imposto_pct       DECIMAL(15,2) NOT NULL,
+    vl_receita_bruta     DECIMAL(18,4) NOT NULL,
+    vl_receita_liquida   DECIMAL(18,4) NOT NULL,
+    vl_receita_final     DECIMAL(18,4) NOT NULL,
+    fl_retornado         CHAR(1)       NOT NULL,
+    fl_status_linha      CHAR(1)       NOT NULL,
+    dt_envio             DATE          NOT NULL,
+    dt_recebimento       DATE          NOT NULL
+)
+DISTKEY (customer_sk)
+SORTKEY (data_sk);
+
+INSERT INTO dw_star_scd2.f_vendas
+SELECT
+    CAST(TO_CHAR(o.o_orderdate, 'YYYYMMDD') AS INTEGER)   AS data_sk,
+    c.customer_sk,
+    pr.produto_sk,
+    s.supplier_sk,
+    g.geografia_sk,
+    l.l_orderkey,
+    l.l_linenumber,
+    l.l_quantity,
+    l.l_extendedprice,
+    l.l_discount,
+    l.l_tax,
+    l.l_extendedprice,
+    l.l_extendedprice * (1 - l.l_discount),
+    l.l_extendedprice * (1 - l.l_discount) * (1 + l.l_tax),
+    l.l_returnflag,
+    l.l_linestatus,
+    l.l_shipdate,
+    l.l_receiptdate
+FROM oltp_mirror.lineitem l
+JOIN oltp_mirror.orders    o  ON o.o_orderkey = l.l_orderkey
+JOIN dw_star_scd2.dim_customer c
+      ON c.c_custkey = o.o_custkey
+     AND o.o_orderdate >= c.valid_from
+     AND o.o_orderdate <= c.valid_to
+JOIN dw_star.dim_produto   pr ON pr.p_partkey  = l.l_partkey
+JOIN dw_star.dim_supplier  s  ON s.s_suppkey   = l.l_suppkey
+JOIN dw_star.dim_geografia g  ON g.n_nationkey = c.n_nationkey;
+
+ANALYZE dw_star_scd2.f_vendas;
+```
+
+<details>
+<summary><b>💡 Clique para entender: o join com range temporal</b></summary>
+<blockquote>
+
+Comparado ao join simples da Modelagem B:
+
+```sql
+-- Modelagem B (SCD1)
+JOIN dw_star.dim_customer c ON c.c_custkey = o.o_custkey
+```
+
+Na Modelagem C (SCD2), adicionamos o filtro temporal:
+
+```sql
+-- Modelagem C (SCD2)
+JOIN dw_star_scd2.dim_customer c
+      ON c.c_custkey = o.o_custkey
+     AND o.o_orderdate >= c.valid_from
+     AND o.o_orderdate <= c.valid_to
+```
+
+### O que isso faz
+
+Para cada linha de pedido, o Redshift procura **qual versão do cliente estava vigente na data do pedido**. Como o range `[valid_from, valid_to]` cobre todo o tempo sem sobreposição (o check #2 garantiu isso), existe **exatamente uma** versão válida para cada data.
+
+### Custo do join
+
+Este join é mais caro que o simples por chave. O Redshift precisa escanear as 2 versões do cliente reclassificado e escolher a correta por range. Em clusters maiores, isso ainda é rápido por causa do paralelismo, mas é um custo real.
+
+### Em produção
+
+Muitos warehouses produtivos encapsulam esse join em uma **view** que esconde a complexidade temporal do analista. Isso é um exemplo de **camada semântica**.
+
+</blockquote>
+</details>
+
+24. Confirme que a fato tem o mesmo grain da B (6.001.215 linhas):
+
+```sql
+SELECT COUNT(*) AS linhas FROM dw_star_scd2.f_vendas;
+```
+
+Se vier menos, algum pedido não encontrou versão vigente do cliente — isso indicaria bug na construção da SCD2.
+
+25. Execute a query-âncora pela terceira vez, agora no modelo SCD2:
+
+```sql
+SELECT
+    g.nm_regiao                                    AS region_name,
+    ROUND(SUM(f.vl_receita_liquida), 2)            AS receita_liquida_1995_automobile,
+    COUNT(*)                                       AS qtd_itens,
+    COUNT(DISTINCT f.customer_sk)                  AS qtd_versoes_cliente_distintas,
+    COUNT(DISTINCT c.c_custkey)                    AS qtd_clientes_distintos
+FROM dw_star_scd2.f_vendas      f
+JOIN dw_star_scd2.dim_customer  c ON c.customer_sk  = f.customer_sk
+JOIN dw_star.dim_geografia      g ON g.geografia_sk = f.geografia_sk
+JOIN dw_star.dim_data           d ON d.data_sk      = f.data_sk
+WHERE d.nr_ano       = 1995
+  AND c.sg_segmento  = 'AUTOMOBILE'
+GROUP BY g.nm_regiao
+ORDER BY receita_liquida_1995_automobile DESC;
+```
+
+<!-- PRINT SUGERIDO: img/query_ancora_N3.png
+     Resultado da query-âncora no modelo C. AMERICA aparece com valor DIFERENTE de N1 e N2 — esse é o clímax pedagógico do lab. -->
+![](img/query_ancora_N3.png)
+
+> [!TIP]
+> **Anote o valor de `AMERICA` como `N₃`**. Agora você tem `N₁`, `N₂` e `N₃`.
+
+### Checkpoint
+
+Se você chegou até aqui, então:
+
+- a `dim_customer` SCD2 tem ~157k linhas versionadas e passa nos 3 checks de integridade
+- a fato `f_vendas` do SCD2 tem 6.001.215 linhas
+- você anotou `N₃`, que deve diferir de `N₁` e `N₂`
+
+---
+
+## Parte 5 - Comparando os três resultados
+
+### Resultado esperado desta parte
+
+Ao final desta etapa, você terá colocado os 3 números lado a lado, entendido por que divergem, e preenchido um documento de decisão simulando um entregável real de engenharia.
+
+26. Monte a tabela comparativa mentalmente:
+
+| Modelagem | Receita AUTOMOBILE 1995 (AMERICA) | Fonte do segmento |
+|-----------|-----------------------------------|-------------------|
+| A — Espelho OLTP | `N₁ = _______` | Segmento **atual** do cliente |
+| B — Star SCD1 | `N₂ ≈ N₁ = _______` | Segmento **atual** (SCD1 sobrescreve) |
+| C — Star SCD2 | `N₃ = _______` | Segmento que o cliente tinha **em 1995** |
+
+27. Rode esta query bônus para ver quantos clientes foram reclassificados no "para dentro" ou "para fora" de `AUTOMOBILE`. Isso quantifica a divergência:
+
+```sql
+-- Clientes que ERAM AUTOMOBILE mas NÃO são mais (reclassificação saindo)
+SELECT 'EX_AUTOMOBILE' AS tipo, COUNT(*) AS qtd
+FROM oltp_mirror.customer          oc
+JOIN dw_star_scd2.customer_history h ON h.c_custkey = oc.c_custkey
+WHERE oc.c_mktsegment   = 'AUTOMOBILE'
+  AND h.mktsegment_new <> 'AUTOMOBILE'
+
+UNION ALL
+
+-- Clientes que HOJE são AUTOMOBILE mas NÃO eram originalmente (reclassificação entrando)
+SELECT 'VIROU_AUTOMOBILE' AS tipo, COUNT(*) AS qtd
+FROM oltp_mirror.customer          oc
+JOIN dw_star_scd2.customer_history h ON h.c_custkey = oc.c_custkey
+WHERE oc.c_mktsegment   <> 'AUTOMOBILE'
+  AND h.mktsegment_new  = 'AUTOMOBILE';
+```
+
+<!-- PRINT SUGERIDO: img/reclassificacao_quantitativa.png
+     Resultado mostrando quantos clientes entraram/saíram do segmento AUTOMOBILE.
+     Esses números explicam exatamente a diferença entre N1/N2 e N3. -->
+![](img/reclassificacao_quantitativa.png)
+
+### Qual dos três números é o certo?
+
+A resposta honesta: **depende da pergunta que o negócio está fazendo**.
+
+- *"Hoje, olhando para os clientes AUTOMOBILE da base atual, quanto eles representaram em receita em 1995?"* → use `N₁`/`N₂`
+- *"Qual foi o faturamento do segmento AUTOMOBILE em 1995, considerando como o cliente era classificado na época?"* → use `N₃`
+
+Ambas as perguntas são legítimas. Ambas aparecem em reuniões reais. A diferença é de 5% dos clientes reclassificados, mas pode virar milhões de dólares.
+
+> [!IMPORTANT]
+> O trabalho do engenheiro de dados não é escolher sozinho entre `N₁`, `N₂` e `N₃`. É tornar as duas perguntas **distinguíveis**, **conversáveis** e **auditáveis**. Uma modelagem bem feita permite expor as duas lado a lado, com nomes explícitos e contratos claros.
+
+28. Copie o template e preencha sua decisão:
+
+```bash
+cp DECISION_TEMPLATE.md DECISION.md
+```
+
+O [`DECISION_TEMPLATE.md`](DECISION_TEMPLATE.md) tem seções para: contexto, os três números observados, decisão + alternativas descartadas, consequências, perguntas a fazer ao stakeholder, decisões técnicas secundárias (distkey, sortkey, receita materializada vs. view).
+
+> [!TIP]
+> Em entrevistas de engenharia de dados, esse tipo de documento aparece como sinal de senioridade. Saber escrever um é tão importante quanto saber escrever o SQL.
+
+---
+
+## Conclusão
+
+Se você chegou até aqui, você implementou:
+
+- modelo operacional (OLTP mirror) como baseline
+- star schema completo com 5 dimensões e fato
+- SCD Tipo 1 (sobrescrita de atributo)
+- SCD Tipo 2 (versionamento de atributo com range temporal)
+- query-âncora rodando nos 3 schemas e produzindo `N₁`, `N₂` e `N₃`
+- documento de decisão (`DECISION.md`) simulando entregável real
+
+Este laboratório serve como base para o próximo exercício, onde você vai sentir na pele o que acontece quando o **negócio evolui** e a modelagem que parecia perfeita hoje precisa acomodar uma demanda nova amanhã.
+
+---
+
+## Onde tirar os prints
+
+Para quem quer ajudar na documentação visual, os pontos sugeridos para captura estão marcados no arquivo acima como `<!-- PRINT SUGERIDO: ... -->` (invisíveis no markdown renderizado mas visíveis no código-fonte). Em resumo:
+
+| # | Arquivo | Contexto a capturar |
+|---|---------|--------------------|
+| 1 | `img/redshift_query_editor_landing.png` | Tela inicial do Query Editor v2 no console AWS |
+| 2 | `img/redshift_create_connection.png` | Menu de contexto no cluster com "Create connection" destacado |
+| 3 | `img/redshift_connection_form.png` | Caixa de autenticação preenchida (senha coberta) |
+| 4 | `img/redshift_first_query.png` | Resultado de `SELECT current_database()...` |
+| 5 | `img/oltp_create_schema_success.png` | Mensagem de sucesso após `CREATE SCHEMA` + 8 `CREATE TABLE` |
+| 6 | `img/redshift_account_id.png` | Resultado de `current_aws_account()` |
+| 7 | `img/oltp_sanity_check.png` | 8 linhas do `SELECT UNION ALL` mostrando contagens |
+| 8 | `img/query_ancora_N1.png` | Resultado da query-âncora no OLTP — `N₁` |
+| 9 | `img/dim_data_loaded.png` | Resultado de `SELECT COUNT(*), MIN, MAX FROM dim_data` |
+| 10 | `img/dw_star_dims_loaded.png` | Contagem das 5 dimensões do star schema |
+| 11 | `img/query_ancora_N2.png` | Resultado da query-âncora no star SCD1 — `N₂` |
+| 12 | `img/explain_oltp_vs_star.png` | Planos de execução lado a lado |
+| 13 | `img/customer_history_loaded.png` | ~7500 linhas de `customer_history` |
+| 14 | `img/scd2_integrity_checks.png` | 3 checks de integridade SCD2 com zero violações |
+| 15 | `img/query_ancora_N3.png` | Resultado da query-âncora no SCD2 — `N₃` (diferente!) |
+| 16 | `img/reclassificacao_quantitativa.png` | Clientes que entraram/saíram de AUTOMOBILE |
+
+**Como tirar**: use `Cmd+Shift+4` no macOS ou `Print Screen` no Windows, salve como PNG, rename para o padrão sugerido e coloque em `03-Data-Modeling-e-Data-Warehouse/2-modelagem-e-carga/img/`.
+
+---
+
+## Próximo passo
+
+No [Lab 03.2](../3-analise-dimensional/README.md) você vai partir do schema que escolheu aqui e ver o que acontece quando o **negócio evolui**: nova fórmula de receita, redefinição de "cliente ativo", SLA apertado de dashboard.
+
+---
+
+## Troubleshooting
+
+### `COPY` falha com `Check 'stl_load_errors' for details`
+
+```sql
+SELECT filename, line_number, colname, err_reason
+FROM stl_load_errors
+ORDER BY starttime DESC
+LIMIT 10;
+```
+
+Causa mais comum: bucket S3 não existe ou não tem Parquet. Verifique no Codespaces:
+
+```bash
+aws s3 ls "s3://dw-lab-$(aws sts get-caller-identity --query Account --output text)/raw/tpch/" --recursive
+```
+
+### Query-âncora retorna vazio
+
+Provavelmente a `dim_data` foi gerada para janela diferente. Confira:
+
+```sql
+SELECT MIN(dt_completa), MAX(dt_completa) FROM dw_star.dim_data;
+```
+
+Deve cobrir 1992-01-01 a 1998-12-31.
+
+### `stl_plan_info` vazia ao gerar `dim_data`
+
+Em cluster recém-criado, essa system table pode ter poucas linhas. Use o fallback com CTE recursiva documentado no arquivo `sql/b_star_scd1/02_dim_data.sql`.
