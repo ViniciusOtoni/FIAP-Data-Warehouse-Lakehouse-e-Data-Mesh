@@ -184,7 +184,7 @@ O aluno roda a query-âncora nos três schemas e obtém **três números diferen
 | C (Star SCD2) | $X₃ | Reflete segmento que o cliente tinha **em 1995** |
 
 > [!NOTE]
-> Para o aluno conseguir reproduzir isso de forma didática, o `load_tpch.sh` **injeta de propósito** uma evolução: ~5% dos clientes da TPC-H recebem reclassificação de segmento com data de alteração posterior a 1995. Essa alteração é registrada em uma tabela `customer_history` carregada junto. A tabela `customer` original do TPC-H vira o "snapshot atual" e a `customer_history` alimenta o SCD2.
+> Para o aluno conseguir reproduzir isso de forma didática, o `load_tpch.sh` **injeta de propósito** uma evolução: **exatamente ~7.500 clientes** (5% da base SF1 de 150k, sorteio determinístico com seed `42` — todos os alunos obtêm o mesmo conjunto) recebem reclassificação de segmento com data de alteração posterior a 1995. Essa alteração é registrada em uma tabela `customer_history` carregada junto. A tabela `customer` original do TPC-H vira o "snapshot atual" e a `customer_history` alimenta o SCD2.
 
 **Conceitos exercitados (expandidos)**:
 - Grain declaration explícito e **comparação com o não-grain** do espelho OLTP

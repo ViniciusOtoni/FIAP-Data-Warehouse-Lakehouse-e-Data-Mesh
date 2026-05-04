@@ -1,10 +1,33 @@
 # 03.2 - Evolução do negócio: quando a modelagem tem que mudar
 
-**Antes de começar, execute os passos abaixo para configurar o ambiente caso não tenha feito isso ainda na aula de HOJE: [Preparando Credenciais](../../00-create-codespaces/Inicio-de-aula.md)**
-
-**Este laboratório assume que o schema `dw_star` existe e está populado** (fato `f_vendas`, dimensões `dim_customer` com SCD1, `dim_produto`, `dim_supplier`, `dim_geografia`, `dim_data`). Se você ainda não fez o [Lab 03.1](../02-modelagem-e-carga/README.md), volte e execute a Parte 3 dele. As queries deste lab consultam `dw_star.*` diretamente.
-
 Neste laboratório, você sente na prática por que a modelagem raramente sobrevive inalterada de um trimestre para o outro. Três evoluções de negócio são aplicadas sobre o star schema do Lab 03.1, e cada uma força uma decisão de redesign.
+
+> [!WARNING]
+> **Pré-requisitos obrigatórios antes de começar:**
+>
+> - [ ] Credenciais AWS do Academy atualizadas no Codespaces — ver [Preparando Credenciais](../../00-create-codespaces/Inicio-de-aula.md)
+> - [ ] Cluster Redshift `dw-aula3-<short_id>` em status `available` (Lab [03.0 · Provisionamento](../01-provisionamento/README.md) executado)
+> - [ ] Schema `dw_star` populado com o star schema SCD Tipo 1 (Lab [03.1 · Parte 3](../02-modelagem-e-carga/README.md#parte-3---modelagem-b-star-schema-com-scd-tipo-1) inteira executada)
+> - [ ] Você consegue conectar no Query Editor v2 ou via psql no Codespaces
+>
+> **Valide rapidamente rodando esta query no Query Editor v2 antes de prosseguir:**
+>
+> ```sql
+> SELECT COUNT(*) AS linhas_fato FROM dw_star.f_vendas;
+> -- Esperado: 6001215
+> ```
+>
+> Se retornar `relation "dw_star.f_vendas" does not exist` ou `0 linhas`, volte ao Lab 03.1 e complete a Parte 3 antes de seguir aqui.
+
+## O que você vai fazer
+
+3 evoluções de negócio aplicadas sobre o `dw_star` existente, sem recarregar dados do zero. Tempo estimado: **60–75 min** em cluster `ra3.large` single-node.
+
+1. **Evolução 1** — Nova fórmula de receita com comissão de marketplace (Views + Materialized Views versionadas)
+2. **Evolução 2** — Redefinição de "cliente ativo" (SCD Tipo 2 × fato snapshot periódico)
+3. **Evolução 3** — SLA de 5s no dashboard executivo (redesign de DISTKEY × MV pré-agregada)
+4. **Reflexão final** — 4 perguntas discursivas para fechar o raciocínio
+5. **Destruição da infra** — `terraform destroy` obrigatório ao final
 
 ## Arquitetura
 
