@@ -37,10 +37,10 @@ Esse é o cenário que vamos explorar juntos durante a aula. Você vai acompanha
 
 Três schemas no mesmo cluster Redshift, a mesma query-âncora rodada nos três, **três números diferentes**. Tempo estimado: **75–100 min** em cluster `ra3.large` × 2 nós (execução pura ~14 min + tempo para você ler, copiar comandos, observar resultados e refletir; o `COPY` da Modelagem A leva ~9 min só para `lineitem` por causa dos 60M linhas em SF10).
 
-1. **Modelagem A** (`oltp_mirror`) — cópia fiel do OLTP → produz `N₁`
-2. **Modelagem B** (`dw_star`) — star schema SCD Tipo 1 → produz `N₂ ≈ N₁`
-3. **Modelagem C** (`dw_star_scd2`) — star schema SCD Tipo 2 → produz `N₃ ≠ N₁`
-4. **Decisão final** — preencher `DECISION.md` (estilo ADR) escolhendo qual modelagem você levaria para produção
+- **Modelagem A** (`oltp_mirror`) — cópia fiel do OLTP → produz `N₁`
+- **Modelagem B** (`dw_star`) — star schema SCD Tipo 1 → produz `N₂ ≈ N₁`
+- **Modelagem C** (`dw_star_scd2`) — star schema SCD Tipo 2 → produz `N₃ ≠ N₁`
+- **Decisão final** — preencher `DECISION.md` (estilo ADR) escolhendo qual modelagem você levaria para produção
 
 ## Arquitetura
 

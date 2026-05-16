@@ -241,15 +241,18 @@ Dois caminhos suportados. Escolha um:
      mais erra na primeira vez. -->
 ![](img/qev2_create_connection.png)
 
-1. No console AWS, abra **Redshift → Query Editor v2**
-2. Clique no cluster `dw-aula3-<short_id>`
-3. **Database user and password** → use `dwadmin` e a senha de (executar no terminal do Codespaces):
+**3.1.** No console AWS, abra **Redshift → Query Editor v2**
 
-   ```bash
-   cd /workspaces/FIAP-Data-Warehouse-Lakehouse-e-Data-Mesh/03-Data-Modeling-e-Data-Warehouse/01-provisionamento
-   terraform output -raw redshift_master_password
-   ```
-4. Database: `dw_mba`
+**3.2.** Clique no cluster `dw-aula3-<short_id>`
+
+**3.3.** **Database user and password** → use `dwadmin` e a senha de (executar no terminal do Codespaces):
+
+```bash
+cd /workspaces/FIAP-Data-Warehouse-Lakehouse-e-Data-Mesh/03-Data-Modeling-e-Data-Warehouse/01-provisionamento
+terraform output -raw redshift_master_password
+```
+
+**3.4.** Database: `dw_mba`
 
 #### Caminho B — psql no Codespaces
 
@@ -274,14 +277,15 @@ SELECT current_user, current_database(), version();
 
 Verifique, em ordem:
 
-1. O cluster está `available`:
+- **(a)** O cluster está `available`:
 
    ```bash
    aws redshift describe-clusters --query 'Clusters[*].ClusterStatus' --output text
    ```
 
-2. O Security Group permite sua origem. Se `allowed_cidr_blocks = 0.0.0.0/0` (padrão do lab), isso não deveria bloquear. Se você restringiu, confira se seu IP público atual está incluído.
-3. A senha está correta. Pegue-a de novo, inteira e sem espaços:
+- **(b)** O Security Group permite sua origem. Se `allowed_cidr_blocks = 0.0.0.0/0` (padrão do lab), isso não deveria bloquear. Se você restringiu, confira se seu IP público atual está incluído.
+
+- **(c)** A senha está correta. Pegue-a de novo, inteira e sem espaços:
 
    ```bash
    cd /workspaces/FIAP-Data-Warehouse-Lakehouse-e-Data-Mesh/03-Data-Modeling-e-Data-Warehouse/01-provisionamento
@@ -297,10 +301,7 @@ Verifique, em ordem:
 
 ### 4. Prossiga para o Lab 03.2
 
-```bash
-cd /workspaces/FIAP-Data-Warehouse-Lakehouse-e-Data-Mesh/03-Data-Modeling-e-Data-Warehouse/02-modelagem-e-carga
-cat README.md
-```
+Abra o próximo lab: **[Lab 03.2 — Do OLTP ao Star Schema](../02-modelagem-e-carga/README.md)**.
 
 > [!CAUTION]
 > **Se você não vai prosseguir agora para o Lab 03.2**, rode `terraform destroy` antes de fechar a aula. O cluster Redshift cobra mesmo ocioso (~$0,51/h). Veja a seção [Ao final da aula: destruir tudo](#ao-final-da-aula-destruir-tudo) abaixo.

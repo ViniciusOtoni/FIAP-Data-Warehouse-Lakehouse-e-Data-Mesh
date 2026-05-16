@@ -35,11 +35,11 @@ Este laboratório é o que acontece nesse trimestre. Vamos sentir na prática po
 
 3 evoluções de negócio aplicadas sobre o `dw_star` existente, sem recarregar dados do zero. Tempo estimado: **70–90 min** em cluster `ra3.large` × 2 nós (execução pura ~5 min + tempo para você ler os blocos `<details>`, observar resultados das queries-alvo e refletir nas perguntas discursivas).
 
-1. **Evolução 1** — Nova fórmula de receita com comissão de marketplace (Views + Materialized Views versionadas)
-2. **Evolução 2** — Redefinição de "cliente ativo" (SCD Tipo 2 × fato snapshot periódico)
-3. **Evolução 3** — SLA de 5s no dashboard executivo (redesign de DISTKEY × MV pré-agregada)
-4. **Reflexão final** — 4 perguntas discursivas para fechar o raciocínio
-5. **Destruição da infra** — `terraform destroy` obrigatório ao final
+- **Evolução 1** — Nova fórmula de receita com comissão de marketplace (Views + Materialized Views versionadas)
+- **Evolução 2** — Redefinição de "cliente ativo" (SCD Tipo 2 × fato snapshot periódico)
+- **Evolução 3** — SLA de 5s no dashboard executivo (redesign de DISTKEY × MV pré-agregada)
+- **Reflexão final** — 4 perguntas discursivas para fechar o raciocínio
+- **Destruição da infra** — `terraform destroy` obrigatório ao final
 
 ## Arquitetura
 
@@ -1296,17 +1296,17 @@ Se você chegou até aqui, então:
 
 As perguntas abaixo não têm resposta única, mas têm respostas **melhores** que outras. Use-as para fechar o lab por escrito (no final do `DECISION.md` do Lab 03.2 ou em arquivo novo):
 
-1. **"Você recalcularia o histórico com a nova fórmula de receita, ou manteria o número antigo congelado?"**
-   Em que contexto a resposta muda?
+**Pergunta R1.** **"Você recalcularia o histórico com a nova fórmula de receita, ou manteria o número antigo congelado?"**
+Em que contexto a resposta muda?
 
-2. **"O que é 'correto': o número da métrica no dia em que foi publicada, ou o número recalculado com a regra atual?"**
-   Existe resposta universal, ou depende de quem está pedindo?
+**Pergunta R2.** **"O que é 'correto': o número da métrica no dia em que foi publicada, ou o número recalculado com a regra atual?"**
+Existe resposta universal, ou depende de quem está pedindo?
 
-3. **"Se o CEO pedir 'a mesma tabela de 2023', você entrega como ela era, ou como ela fica aplicando as regras de hoje aos dados antigos?"**
-   Como a modelagem ajuda a separar esses dois mundos?
+**Pergunta R3.** **"Se o CEO pedir 'a mesma tabela de 2023', você entrega como ela era, ou como ela fica aplicando as regras de hoje aos dados antigos?"**
+Como a modelagem ajuda a separar esses dois mundos?
 
-4. **"Você começaria o próximo warehouse implementando SCD2 em tudo, ou SCD1 e só promoveria para SCD2 quando surgisse demanda explícita?"**
-   Existe "padrão seguro"?
+**Pergunta R4.** **"Você começaria o próximo warehouse implementando SCD2 em tudo, ou SCD1 e só promoveria para SCD2 quando surgisse demanda explícita?"**
+Existe "padrão seguro"?
 
 > [!TIP]
 > A maturidade aparece em responder com "depende de X e Y" em vez de "sempre Z". Este lab é um exercício de raciocínio, não de memorização.
