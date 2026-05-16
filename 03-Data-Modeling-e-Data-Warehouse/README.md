@@ -346,11 +346,10 @@ Toda a infraestrutura sobe via **Terraform** na pasta `01-provisionamento/`. Nen
 1. **É o que o Learner Lab permite** — Serverless não aparece no PDF de restrições, portanto tratamos como indisponível.
 2. **Multi-node leve cabe no budget** — 2 × `ra3.large` (limite do Learner Lab) custa ~$0,51/h, irrelevante no contexto de uma aula de 2-3h. O 2º nó dobra os slices (2 → 4) e reduz o `COPY` de `lineitem` (60M linhas) de ~9 min para ~6 min.
 3. **Pedagogicamente rico mesmo com 1 nó** — mesmo sem múltiplos nós, o aluno observa distribuição por slices, sort keys, compressão colunar, materialized views e MPP interno por slice. Single-node `ra3.large` tem 2 slices, suficiente para ver redistribuição de dados em `EXPLAIN ANALYZE`.
-4. **Pausa suportada** — `aws redshift pause-cluster` reduz custo entre aulas (aluno pausa ao final da sessão).
-5. **Aceita a role `LabRole`** associada via IAM role attachment — sem criar role nova.
+4. **Aceita a role `LabRole`** associada via IAM role attachment — sem criar role nova.
 
 > [!WARNING]
-> O cluster **continua consumindo budget mesmo ocioso** enquanto não for pausado ou deletado. O `terraform destroy` no final da aula é parte obrigatória do fluxo.
+> O cluster **continua consumindo budget mesmo ocioso** enquanto não for deletado. O `terraform destroy` no final da aula é **parte obrigatória do fluxo** — não é opcional.
 
 ### Por que Terraform e não CloudFormation ou shell?
 

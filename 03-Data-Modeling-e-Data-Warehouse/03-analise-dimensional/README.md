@@ -1328,14 +1328,14 @@ Preços públicos AWS para a região `us-east-1` (valores de referência on-dema
 
 | Recurso | Preço unitário | Custo/dia (24h) | Custo/mês (720h) |
 |---------|---------------|-----------------|-------------------|
-| **Redshift `ra3.large` × 1 nó** | ~$0,287/hora | **~$6,89** | **~$207** |
-| **Redshift Managed Storage** (dados do TPC-H) | $0,024/GB-mês | ~$0,03 | ~$0,80 |
-| **S3 Standard** (~1 GB de Parquet) | $0,023/GB-mês | negligível | ~$0,02 |
+| **Redshift `ra3.large` × 2 nós** | ~$0,51/hora | **~$12,24** | **~$367** |
+| **Redshift Managed Storage** (dados do TPC-H SF10) | $0,024/GB-mês | ~$0,30 | ~$8 |
+| **S3 Standard** (~10 GB de `.tbl`) | $0,023/GB-mês | negligível | ~$0,23 |
 | **Glue Data Catalog** (primeiros 1M objetos) | grátis | $0 | $0 |
-| **Total estimado** | — | **~$7/dia** | **~$210/mês** |
+| **Total estimado** | — | **~$12,50/dia** | **~$375/mês** |
 
 > [!IMPORTANT]
-> **O cluster Redshift é 99% do custo.** Um fim de semana esquecido (~72h) consome ~$21 do seu budget do Learner Lab. Uma semana inteira, ~$50. Dois fins de semana, o budget acabou.
+> **O cluster Redshift é 99% do custo.** Um fim de semana esquecido (~72h) consome ~$37 do seu budget do Learner Lab. Uma semana inteira, ~$87. Sem destroy, em poucas semanas o budget acaba e a conta é desativada — perdendo todo o progresso.
 
 ### 28. Volte ao terminal do Codespaces
 

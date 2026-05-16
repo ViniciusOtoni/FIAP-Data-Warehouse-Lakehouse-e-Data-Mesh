@@ -3,7 +3,7 @@
 Este é o primeiro passo do Lab 03. Aqui o aluno sobe — via **Terraform** — toda a infraestrutura necessária para os exercícios de modelagem dimensional e Redshift. Nenhum clique em console além de copiar credenciais do AWS Academy.
 
 > [!TIP]
-> Leia primeiro a [proposta geral do Lab 03](../README.md) antes de executar este passo. Aqui o foco é **operacional**: subir, usar, pausar, destruir.
+> Leia primeiro a [proposta geral do Lab 03](../README.md) antes de executar este passo. Aqui o foco é **operacional**: subir, usar, destruir.
 
 ## Arquitetura
 
@@ -302,28 +302,8 @@ cd /workspaces/FIAP-Data-Warehouse-Lakehouse-e-Data-Mesh/03-Data-Modeling-e-Data
 cat README.md
 ```
 
----
-
-## Durante a aula: pausar o cluster para economizar budget
-
-Se a aula tem intervalo longo, **pause o cluster** em vez de deletar. Isso preserva dados e schemas, mas zera o custo de computação.
-
-```bash
-cd /workspaces/FIAP-Data-Warehouse-Lakehouse-e-Data-Mesh/03-Data-Modeling-e-Data-Warehouse/01-provisionamento
-aws redshift pause-cluster \
-  --cluster-identifier "$(terraform output -raw redshift_cluster_identifier)"
-```
-
-Para retomar:
-
-```bash
-cd /workspaces/FIAP-Data-Warehouse-Lakehouse-e-Data-Mesh/03-Data-Modeling-e-Data-Warehouse/01-provisionamento
-aws redshift resume-cluster \
-  --cluster-identifier "$(terraform output -raw redshift_cluster_identifier)"
-```
-
-> [!WARNING]
-> Um cluster pausado **ainda cobra storage** (RMS no S3 gerenciado), mas não computação. O `terraform destroy` abaixo é a única forma de parar o custo completamente.
+> [!CAUTION]
+> **Se você não vai prosseguir agora para o Lab 03.2**, rode `terraform destroy` antes de fechar a aula. O cluster Redshift cobra mesmo ocioso (~$0,51/h). Veja a seção [Ao final da aula: destruir tudo](#ao-final-da-aula-destruir-tudo) abaixo.
 
 ---
 
