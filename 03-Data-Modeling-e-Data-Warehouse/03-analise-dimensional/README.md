@@ -598,44 +598,86 @@ DISTKEY (customer_sk)
 SORTKEY (data_sk);
 ```
 
-15. Popule a fato snapshot (pode levar 1-2 minutos, são ~10M linhas):
+15. Popule a fato snapshot. Em SF10 são **~108M linhas** (1,5M clientes × 72 meses), o que é pesado de uma vez só. Particionamos a carga **ano por ano** — 6 INSERTs sequenciais, cada um terminando em ~30-60s:
 
 ```sql
+-- 1996
 INSERT INTO dw_star.f_customer_status_mensal
 WITH meses AS (
     SELECT DISTINCT
         DATE_TRUNC('month', dt_completa) :: DATE AS mes_ref,
         CAST(TO_CHAR(DATE_TRUNC('month', dt_completa), 'YYYYMMDD') AS INTEGER) AS data_sk
     FROM dw_star.dim_data
-    WHERE dt_completa BETWEEN DATE '1993-01-01' AND DATE '1998-12-31'
+    WHERE EXTRACT(YEAR FROM dt_completa) = 1996
+),
+clientes_com_compra AS (
+    SELECT DISTINCT customer_sk FROM dw_star.f_vendas
+),
+compras_mensais AS (
+    SELECT
+        f.customer_sk,
+        DATE_TRUNC('month', d.dt_completa) :: DATE AS mes_compra,
+        COUNT(DISTINCT f.nr_pedido) AS qt_pedidos,
+        SUM(f.vl_receita_liquida)   AS vl_receita
+    FROM dw_star.f_vendas f
+    JOIN dw_star.dim_data d ON d.data_sk = f.data_sk
+    WHERE d.dt_completa >= DATE '1995-01-01'
+      AND d.dt_completa <  DATE '1997-01-01'
+    GROUP BY f.customer_sk, DATE_TRUNC('month', d.dt_completa)
 ),
 agregado_12m AS (
     SELECT
-        m.mes_ref,
-        m.data_sk,
-        c.customer_sk,
-        c.vl_saldo,
-        COUNT(DISTINCT f.nr_pedido) AS qt_pedidos,
-        COALESCE(SUM(f.vl_receita_liquida), 0) AS vl_receita
+        m.mes_ref, m.data_sk, c.customer_sk, c.vl_saldo,
+        COALESCE(SUM(cm.qt_pedidos), 0) AS qt_pedidos,
+        COALESCE(SUM(cm.vl_receita), 0) AS vl_receita
     FROM meses m
     CROSS JOIN dw_star.dim_customer c
-    LEFT JOIN dw_star.f_vendas f
-      ON f.customer_sk = c.customer_sk
-     AND CAST(TO_CHAR(DATE_TRUNC('month', f.dt_envio), 'YYYYMMDD') AS INTEGER)
-           BETWEEN CAST(TO_CHAR(DATEADD(month, -12, m.mes_ref), 'YYYYMMDD') AS INTEGER)
-               AND CAST(TO_CHAR(DATEADD(month, -1,  m.mes_ref), 'YYYYMMDD') AS INTEGER)
+    LEFT JOIN compras_mensais cm
+      ON cm.customer_sk = c.customer_sk
+     AND cm.mes_compra >= DATEADD(month, -12, m.mes_ref)
+     AND cm.mes_compra <  m.mes_ref
+    WHERE c.customer_sk IN (SELECT customer_sk FROM clientes_com_compra)
     GROUP BY m.mes_ref, m.data_sk, c.customer_sk, c.vl_saldo
 )
 SELECT
-    data_sk,
-    customer_sk,
+    data_sk, customer_sk,
     CASE WHEN qt_pedidos > 0 AND vl_saldo > -5000 THEN TRUE ELSE FALSE END AS is_active,
-    qt_pedidos  AS qt_pedidos_12m,
-    vl_receita  AS vl_receita_12m
+    qt_pedidos AS qt_pedidos_12m,
+    vl_receita AS vl_receita_12m
 FROM agregado_12m;
+```
 
+Repita o bloco acima trocando o ano em **três lugares**: na CTE `meses` (`EXTRACT(YEAR FROM dt_completa) = ANO`), e nas duas datas da CTE `compras_mensais` (filtra `ANO-1` e `ANO+1`). Os anos a rodar são **1993, 1994, 1995, 1996, 1997, 1998**.
+
+Após os 6 INSERTs, atualize as estatísticas:
+
+```sql
 ANALYZE dw_star.f_customer_status_mensal;
 ```
+
+<details>
+<summary><b>💡 Clique para entender: por que particionar a carga por ano</b></summary>
+<blockquote>
+
+A versão "tudo de uma vez" faria CROSS JOIN de **72 meses × 1,5M clientes = 108M pares** + LEFT JOIN com 60M linhas de `f_vendas` + GROUP BY. Em `ra3.large × 2` isso ultrapassa a memória de trabalho do cluster e causa derrame para disco — de 25 minutos para 25 minutos sem retornar nada (timeout silencioso do WLM).
+
+### A solução clássica: particionar por dimensão temporal
+
+Em vez de calcular a fato snapshot inteira de uma vez, calculamos **um ano de cada vez**. Cada ano tem 12 meses × 1,5M clientes = 18M pares — muito mais leve. O resultado final é idêntico (`UNION ALL` implícito via 6 `INSERT INTO ... SELECT` consecutivos).
+
+### Por que isso é a forma certa em produção
+
+Pipelines de carga de fatos snapshot reais sempre particionam por uma janela temporal — diária ou mensal — pelo mesmo motivo: **isolar o tamanho de cada batch** para caber na janela de manutenção e na memória do cluster.
+
+### Trade-off
+
+Ganhamos previsibilidade e controle, perdemos um pouco de eficiência de planejador (cada INSERT planeja sozinho). Para datasets pequenos, fazer tudo de uma vez é mais simples; para datasets reais, particionar é mandatório.
+
+</blockquote>
+</details>
+
+> [!TIP]
+> Se quiser pular esta etapa pesada (~6 min total) e seguir para os passos seguintes, pode reduzir para **só os anos 1996-1998** — basta rodar 3 INSERTs em vez de 6. As queries 16-19 abaixo ainda funcionam, só não têm dados anteriores a 1996.
 
 16. Mesma pergunta (ativos em 1996-06-01), agora na fato snapshot:
 
@@ -853,6 +895,12 @@ INSERT INTO dw_star.f_vendas
 SELECT * FROM dw_star.f_vendas_original;
 
 ANALYZE dw_star.f_vendas;
+```
+
+> [!IMPORTANT]
+> O `VACUUM` **precisa rodar em uma transação separada** — Redshift não aceita `VACUUM` no meio de um bloco multi-statement. Rode-o em um bloco próprio:
+
+```sql
 VACUUM dw_star.f_vendas;
 ```
 
