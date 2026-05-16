@@ -280,14 +280,14 @@ REFRESH MATERIALIZED VIEW dw_star.mv_receita_liquida_v2_mensal;
 
 ```sql
 SELECT
-    schemaname,
+    schema_name,
     name,
     is_stale,
     autorefresh,
     state
 FROM svv_mv_info
-WHERE schemaname = 'dw_star'
-  AND name       = 'mv_receita_liquida_v2_mensal';
+WHERE schema_name = 'dw_star'
+  AND name        = 'mv_receita_liquida_v2_mensal';
 ```
 
 <!-- PRINT SUGERIDO: img/mv_status_ok.png
@@ -469,33 +469,32 @@ WITH meses AS (
     FROM dw_star.dim_data
     WHERE dt_completa BETWEEN DATE '1993-01-01' AND DATE '1998-12-31'
 ),
-compras AS (
+compras_mes AS (
     SELECT
-        f.customer_sk,
         c.c_custkey,
         DATE_TRUNC('month', d.dt_completa) :: DATE AS mes_compra
     FROM dw_star.f_vendas     f
     JOIN dw_star.dim_data     d ON d.data_sk     = f.data_sk
     JOIN dw_star.dim_customer c ON c.customer_sk = f.customer_sk
-    GROUP BY f.customer_sk, c.c_custkey, DATE_TRUNC('month', d.dt_completa)
+    GROUP BY c.c_custkey, DATE_TRUNC('month', d.dt_completa)
+),
+clientes_meses AS (
+    SELECT cust.c_custkey, cust.vl_saldo, m.mes_ref
+    FROM dw_star.dim_customer cust
+    CROSS JOIN meses m
 ),
 status_mensal AS (
     SELECT
-        cust.c_custkey,
-        m.mes_ref,
-        CASE
-            WHEN EXISTS (
-                SELECT 1
-                FROM compras cp
-                WHERE cp.c_custkey = cust.c_custkey
-                  AND cp.mes_compra >= DATEADD(month, -12, m.mes_ref)
-                  AND cp.mes_compra <  m.mes_ref
-            )
-             AND cust.vl_saldo > -5000
-            THEN TRUE ELSE FALSE
-        END AS is_active
-    FROM dw_star.dim_customer cust
-    CROSS JOIN meses m
+        cm.c_custkey,
+        cm.mes_ref,
+        CASE WHEN MAX(cmp.c_custkey) IS NOT NULL AND cm.vl_saldo > -5000
+             THEN TRUE ELSE FALSE END AS is_active
+    FROM clientes_meses cm
+    LEFT JOIN compras_mes cmp
+      ON cmp.c_custkey = cm.c_custkey
+     AND cmp.mes_compra >= DATEADD(month, -12, cm.mes_ref)
+     AND cmp.mes_compra <  cm.mes_ref
+    GROUP BY cm.c_custkey, cm.mes_ref, cm.vl_saldo
 ),
 marcos AS (
     SELECT

@@ -137,11 +137,20 @@ fi
 echo "   total da copia paralela: ${overall_elapsed}s"
 
 # -----------------------------------------------------------------------------
-# Geracao da customer_history sintetica
+# Geracao da customer_history sintetica + atualizacao do customer.tbl "atual"
 # -----------------------------------------------------------------------------
-# Para gerar a customer_history precisamos da customer real. Como nao queremos
-# baixar customer.tbl inteiro (243 MB), usamos a copia ja no bucket do aluno:
-# baixar so customer.tbl (243 MB cabe em RAM tranquilo) e gerar o subset.
+# Pedagogicamente o lab supoe que o OLTP "esquece" o segmento antigo do cliente
+# quando ele eh reclassificado (sobrescreve). Por isso, o customer.tbl que
+# alimenta oltp_mirror.customer precisa refletir o segmento *mais recente* —
+# senao SCD1 e SCD2 produzem o mesmo numero, e a divergencia pedagogica do
+# lab desaparece.
+#
+# O fluxo aqui:
+#   1. Baixa o customer.tbl original do bucket do aluno
+#   2. Sorteia 5% dos clientes (seed=42), aplica reclassificacao
+#   3. Sobe customer_history.tbl com (custkey, novo_segmento, valid_from)
+#   4. Reescreve o customer.tbl com c_mktsegment = mktsegment_new para os
+#      reclassificados, e re-uploada por cima (o COPY do Lab 03.1 puxa este)
 # -----------------------------------------------------------------------------
 echo ""
 echo ">> Baixando customer.tbl para gerar customer_history sintetica..."
@@ -160,12 +169,13 @@ random.seed(42)
 
 cols = ["c_custkey","c_name","c_address","c_nationkey","c_phone",
         "c_acctbal","c_mktsegment","c_comment","__trailing"]
-cust = pd.read_csv(
+cust_full = pd.read_csv(
     os.path.join(WORK_DIR, "customer.tbl"),
     sep="|", header=None, names=cols, engine="c",
-)[["c_custkey","c_mktsegment"]]
+)
+print(f"   - customer base: {len(cust_full):,} clientes")
 
-print(f"   - customer base: {len(cust):,} clientes")
+cust = cust_full[["c_custkey","c_mktsegment"]]
 
 sample = cust.sample(frac=0.05, random_state=42).copy()
 
@@ -179,17 +189,40 @@ sample["mktsegment_new"] = sample["c_mktsegment"].apply(pick_new)
 dates = pd.date_range("1996-01-01","1998-12-31", freq="D")
 sample["valid_from"] = [random.choice(dates).date() for _ in range(len(sample))]
 
-history = sample[["c_custkey","mktsegment_new","valid_from"]].reset_index(drop=True)
+# O customer_history precisa ter o segmento ANTIGO E o NOVO.
+# Sem mktsegment_old, nao da pra construir SCD2 porque a OLTP eh sobrescrita
+# para refletir o segmento atual (pos-reclassificacao).
+sample = sample.rename(columns={"c_mktsegment": "mktsegment_old"})
+history = sample[["c_custkey","mktsegment_old","mktsegment_new","valid_from"]].reset_index(drop=True)
 
-# Escreve em formato .tbl (CSV delimitado por "|", consistente com TPC-H)
-out_path = os.path.join(WORK_DIR, "customer_history.tbl")
-history.to_csv(out_path, sep="|", header=False, index=False, date_format="%Y-%m-%d")
+out_history = os.path.join(WORK_DIR, "customer_history.tbl")
+history.to_csv(out_history, sep="|", header=False, index=False, date_format="%Y-%m-%d")
+print(f"   - customer_history: {len(history):,} reclassificacoes (com mktsegment_old e _new)")
+print(f"     -> {out_history}")
 
-print(f"   - customer_history: {len(history):,} reclassificacoes")
-print(f"     -> {out_path}")
+# Reescreve customer.tbl aplicando a reclassificacao no c_mktsegment.
+# Isso eh pedagogicamente essencial: sem isso, o "snapshot atual" no OLTP
+# fica identico ao historico, e a Modelagem A/B (SCD1) produz N1=N2=N3.
+seg_map = dict(zip(sample["c_custkey"].tolist(), sample["mktsegment_new"].tolist()))
+mask = cust_full["c_custkey"].isin(seg_map)
+cust_full.loc[mask, "c_mktsegment"] = cust_full.loc[mask, "c_custkey"].map(seg_map)
+
+# Remove a coluna trailing (que pandas leu por causa do "|" no fim de cada linha
+# do TPC-H) — o TPC-H sempre termina linhas com "|", entao mantemos.
+out_customer = os.path.join(WORK_DIR, "customer_updated.tbl")
+cust_full.to_csv(out_customer, sep="|", header=False, index=False)
+print(f"   - customer.tbl atualizado: {mask.sum():,} clientes reclassificados")
+print(f"     -> {out_customer}")
 PYEOF
 
 aws s3 cp "${WORK_DIR}/customer_history.tbl" "s3://${BUCKET}/raw/tpch/customer_history/customer_history.tbl" --no-progress
+
+# Sobe o customer.tbl atualizado por cima do original — o COPY do Lab 03.1
+# vai puxar este, ja com o c_mktsegment refletindo a reclassificacao mais
+# recente (snapshot atual).
+echo ""
+echo ">> Subindo customer.tbl atualizado (com c_mktsegment refletindo reclassificacoes)..."
+aws s3 cp "${WORK_DIR}/customer_updated.tbl" "s3://${BUCKET}/raw/tpch/customer/customer.tbl" --no-progress
 
 # -----------------------------------------------------------------------------
 # Registro no Glue Data Catalog
@@ -319,6 +352,7 @@ register_glue_table lineitem '[
 
 register_glue_table customer_history '[
   {"Name":"c_custkey","Type":"bigint"},
+  {"Name":"mktsegment_old","Type":"string"},
   {"Name":"mktsegment_new","Type":"string"},
   {"Name":"valid_from","Type":"date"}
 ]'

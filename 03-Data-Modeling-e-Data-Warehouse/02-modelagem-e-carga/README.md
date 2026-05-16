@@ -1284,6 +1284,7 @@ CREATE SCHEMA dw_star_scd2;
 
 CREATE TABLE dw_star_scd2.customer_history (
     c_custkey       BIGINT      NOT NULL,
+    mktsegment_old  VARCHAR(10) NOT NULL,
     mktsegment_new  VARCHAR(10) NOT NULL,
     valid_from      DATE        NOT NULL
 )
@@ -1344,13 +1345,16 @@ SELECT
 FROM oltp_mirror.customer c
 WHERE c.c_custkey NOT IN (SELECT c_custkey FROM dw_star_scd2.customer_history);
 
--- Onda 2A: versão ORIGINAL dos reclassificados (vigente ANTES da mudança)
+-- Onda 2A: versão ORIGINAL dos reclassificados (vigente ANTES da mudança).
+-- Atenção: o c_mktsegment do oltp_mirror.customer já foi sobrescrito pelo
+-- load_tpch.sh para refletir o segmento *atual* (pós-reclassificação) — então
+-- o segmento ORIGINAL vem de h.mktsegment_old, não da OLTP.
 INSERT INTO dw_star_scd2.dim_customer
 SELECT
     c.c_custkey * 10 + 1            AS customer_sk,
     c.c_custkey,
     c.c_name,
-    c.c_mktsegment                  AS sg_segmento,
+    h.mktsegment_old                AS sg_segmento,
     c.c_acctbal,
     c.c_nationkey,
     DATE '1900-01-01'               AS valid_from,
@@ -1359,7 +1363,9 @@ SELECT
 FROM oltp_mirror.customer          c
 JOIN dw_star_scd2.customer_history h ON h.c_custkey = c.c_custkey;
 
--- Onda 2B: versão NOVA dos reclassificados (vigente a partir de valid_from)
+-- Onda 2B: versão NOVA dos reclassificados (vigente a partir de valid_from).
+-- O segmento NOVO bate com o c_mktsegment atual da OLTP (o load_tpch atualizou
+-- a OLTP para refletir esta classificação), e tambem bate com h.mktsegment_new.
 INSERT INTO dw_star_scd2.dim_customer
 SELECT
     c.c_custkey * 10 + 2            AS customer_sk,
